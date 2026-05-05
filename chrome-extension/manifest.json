@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "PFPA Browser Monitor",
+  "version": "2.0.0",
+  "description": "Sends browser activity to PFPA desktop app and handles form pre-filling",
+  "permissions": ["tabs", "activeTab", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "PFPA Monitor"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png"
+  }
+}
