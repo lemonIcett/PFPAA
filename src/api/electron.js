@@ -1,7 +1,32 @@
 /**
- * electron.js — renderer-side API layer (complete)
- * All calls route through window.electronAPI → IPC → main process
+ * electron.js — renderer-side API layer
+ * Routes through window.electronAPI (Electron) or falls back to browser mocks.
  */
+
+// ── Environment detection ──────────────────────────────────────────────────
+const IS_ELECTRON = typeof window !== 'undefined' && !!window.electronAPI
+const api = IS_ELECTRON ? window.electronAPI : null
+
+// Safe IPC call: returns fallback value if not in Electron
+function ipc(fn, fallback = null) {
+  if (!api) return Promise.resolve(fallback)
+  try {
+    const result = fn(api)
+    return result instanceof Promise ? result : Promise.resolve(result)
+  } catch (e) {
+    console.warn('[electron.js] IPC call failed:', e)
+    return Promise.resolve(fallback)
+  }
+}
+
+// ── Mock data for browser preview ─────────────────────────────────────────
+const MOCK = {
+  signals:      [],
+  predictions:  [],
+  actionLogs:   [],
+  workflows:    [],
+  userSettings: { theme: 'dark', sessionTimeout: 15 },
+}
 
 // ── Table mapping ──────────────────────────────────────────────────────────
 const TABLE_MAP = {
@@ -16,25 +41,33 @@ function makeEntity(entityName) {
   const table = TABLE_MAP[entityName]
   return {
     async list(sort = '-created_date', limit = 80) {
+      if (!api) {
+        if (entityName === 'UserSetting') return [MOCK.userSettings]
+        return MOCK[table] ?? []
+      }
       if (entityName === 'UserSetting') {
-        const s = await window.electronAPI.getSettings()
+        const s = await api.getSettings()
         return s ? [s] : []
       }
-      return window.electronAPI.list(table, sort, limit)
+      return api.list(table, sort, limit)
     },
     async create(data) {
-      if (entityName === 'UserSetting') return window.electronAPI.updateSettings(data)
-      return window.electronAPI.create(table, data)
+      if (!api) return { ...data, id: Date.now().toString() }
+      if (entityName === 'UserSetting') return api.updateSettings(data)
+      return api.create(table, data)
     },
     async update(id, data) {
-      if (entityName === 'UserSetting') return window.electronAPI.updateSettings(data)
-      return window.electronAPI.update(table, id, data)
+      if (!api) return { id, ...data }
+      if (entityName === 'UserSetting') return api.updateSettings(data)
+      return api.update(table, id, data)
     },
-    async delete(id) { return window.electronAPI.remove(table, id) },
+    async delete(id) {
+      if (!api) return null
+      return api.remove(table, id)
+    },
   }
 }
 
-// ── Entities (CRUD) ────────────────────────────────────────────────────────
 export const entities = {
   ContextSignal: makeEntity('ContextSignal'),
   Prediction:    makeEntity('Prediction'),
@@ -43,182 +76,155 @@ export const entities = {
   UserSetting:   makeEntity('UserSetting'),
 }
 
-// ── Integrations ───────────────────────────────────────────────────────────
 export const integrations = {
-  getStatus:            () => window.electronAPI.getIntegrationStatus(),
-  setGoogleCredentials: (c) => window.electronAPI.setGoogleCredentials(c),
-  getGoogleAuthUrl:     () => window.electronAPI.getGoogleAuthUrl(),
-  exchangeGoogleCode:   (code) => window.electronAPI.exchangeGoogleCode(code),
-  disconnectGoogle:     () => window.electronAPI.disconnectGoogle(),
-  connectSlack:         (token) => window.electronAPI.connectSlack(token),
-  disconnectSlack:      () => window.electronAPI.disconnectSlack(),
-  syncNow:              () => window.electronAPI.syncNow(),
-  openExternal:         (url) => window.electronAPI.openExternal(url),
-  initSupabase:         (c) => window.electronAPI.initSupabase(c),
-  supabaseStatus:       () => window.electronAPI.supabaseStatus(),
+  getStatus:            () => ipc(a => a.getIntegrationStatus(), { google: false, slack: false }),
+  setGoogleCredentials: (c) => ipc(a => a.setGoogleCredentials(c)),
+  getGoogleAuthUrl:     () => ipc(a => a.getGoogleAuthUrl(), '#'),
+  exchangeGoogleCode:   (code) => ipc(a => a.exchangeGoogleCode(code)),
+  disconnectGoogle:     () => ipc(a => a.disconnectGoogle()),
+  connectSlack:         (token) => ipc(a => a.connectSlack(token)),
+  disconnectSlack:      () => ipc(a => a.disconnectSlack()),
+  syncNow:              () => ipc(a => a.syncNow()),
+  openExternal:         (url) => IS_ELECTRON ? api.openExternal(url) : window.open(url, '_blank'),
+  initSupabase:         (c) => ipc(a => a.initSupabase(c)),
+  supabaseStatus:       () => ipc(a => a.supabaseStatus(), { connected: false }),
 }
 
-// ── Real action execution ──────────────────────────────────────────────────
 export const actions = {
-  createCalendarEvent:  (params) => window.electronAPI.createCalendarEvent(params),
-  createEmailDraft:     (params) => window.electronAPI.createEmailDraft(params),
-  sendSlackMessage:     (params) => window.electronAPI.sendSlackMessage(params),
-  organizeFiles:        (params) => window.electronAPI.organizeFiles(params),
-  executePrediction:    (id)     => window.electronAPI.executePrediction(id),
+  createCalendarEvent:  (params) => ipc(a => a.createCalendarEvent(params)),
+  createEmailDraft:     (params) => ipc(a => a.createEmailDraft(params)),
+  sendSlackMessage:     (params) => ipc(a => a.sendSlackMessage(params)),
+  organizeFiles:        (params) => ipc(a => a.organizeFiles(params)),
+  executePrediction:    (id)     => ipc(a => a.executePrediction(id)),
 }
 
-// ── Safe action execution (MFA gate for red-level) ─────────────────────────
 export const safeActions = {
-  executePrediction: (id) => window.electronAPI.executePredictionSafe(id),
+  executePrediction: (id) => ipc(a => a.executePredictionSafe(id)),
 }
 
-// ── Workflow chaining ──────────────────────────────────────────────────────
 export const workflowActions = {
-  executeChain: (id) => window.electronAPI.executeWorkflowChain(id),
+  executeChain: (id) => ipc(a => a.executeWorkflowChain(id)),
 }
 
-// ── Undo system ────────────────────────────────────────────────────────────
 export const undo = {
-  execute: (entryId) => window.electronAPI.executeUndo(entryId),
-  list:    ()        => window.electronAPI.listUndo(),
+  execute: (entryId) => ipc(a => a.executeUndo(entryId)),
+  list:    ()        => ipc(a => a.listUndo(), []),
 }
 
-// ── Intelligence (relationships, patterns, preferences) ───────────────────
 export const intelligence = {
-  getRelationships:  () => window.electronAPI.getRelationships(),
-  getPatterns:       () => window.electronAPI.getPatterns(),
-  recordPreference:  (predictionId, outcome) => window.electronAPI.recordPreference(predictionId, outcome),
-  getPreferences:    () => window.electronAPI.getPreferences(),
+  getRelationships:  () => ipc(a => a.getRelationships(), []),
+  getPatterns:       () => ipc(a => a.getPatterns(), []),
+  recordPreference:  (predictionId, outcome) => ipc(a => a.recordPreference(predictionId, outcome)),
+  getPreferences:    () => ipc(a => a.getPreferences(), []),
 }
 
-// ── BIE-3: Preferences (shorthand) ────────────────────────────────────────
 export const preferences = {
-  record: (predictionId, outcome) => window.electronAPI.recordPreference(predictionId, outcome),
-  get:    ()                       => window.electronAPI.getPreferences(),
+  record: (predictionId, outcome) => ipc(a => a.recordPreference(predictionId, outcome)),
+  get:    ()                       => ipc(a => a.getPreferences(), []),
 }
 
-// ── BIE-2: Accuracy tracking ───────────────────────────────────────────────
 export const accuracy = {
-  rate:   (predictionId, wasCorrect) => window.electronAPI.ratePrediction(predictionId, wasCorrect),
-  report: ()                          => window.electronAPI.accuracyReport(),
+  rate:   (predictionId, wasCorrect) => ipc(a => a.ratePrediction(predictionId, wasCorrect)),
+  report: ()                          => ipc(a => a.accuracyReport(), { total: 0, correct: 0, rate: 0 }),
 }
 
-// ── SEC-2 + SGL-1: Auth (biometric / PIN / MFA) ───────────────────────────
 export const auth = {
-  mfa:       (action) => window.electronAPI.requireMFA(action),
-  biometric: (reason) => window.electronAPI.biometricAuth(reason),
-  setPin:    (pin)    => window.electronAPI.setPin(pin),
-  clearPin:  ()       => window.electronAPI.clearPin(),
+  mfa:       (action) => ipc(a => a.requireMFA(action), { approved: true }),
+  biometric: (reason) => ipc(a => a.biometricAuth(reason), { approved: true }),
+  setPin:    (pin)    => ipc(a => a.setPin(pin)),
+  clearPin:  ()       => ipc(a => a.clearPin()),
 }
 
-// ── CAM-1: Window + clipboard monitors ────────────────────────────────────
 export const monitors = {
-  startWindow:    () => window.electronAPI.startWindowMonitor(),
-  startClipboard: () => window.electronAPI.startClipboardMonitor(),
-  stop:           () => window.electronAPI.stopMonitors(),
+  startWindow:    () => ipc(a => a.startWindowMonitor()),
+  startClipboard: () => ipc(a => a.startClipboardMonitor()),
+  stop:           () => ipc(a => a.stopMonitors()),
 }
 
-// ── MMI-3: Global keyboard shortcuts ──────────────────────────────────────
 export const shortcuts = {
-  register:   () => window.electronAPI.registerShortcuts(),
-  unregister: () => window.electronAPI.unregisterShortcuts(),
+  register:   () => ipc(a => a.registerShortcuts()),
+  unregister: () => ipc(a => a.unregisterShortcuts()),
 }
 
-// ── Performance monitoring ─────────────────────────────────────────────────
 export const perf = {
-  report: () => window.electronAPI.getPerfReport(),
+  report: () => ipc(a => a.getPerfReport(), {}),
 }
 
-// ── Session management ─────────────────────────────────────────────────────
 export const session = {
-  ping: () => window.electronAPI.pingSession(),
+  ping: () => ipc(a => a.pingSession()),
 }
 
-// ── Data management ────────────────────────────────────────────────────────
 export const data = {
-  purge: () => window.electronAPI.dataPurge(),
+  purge: () => ipc(a => a.dataPurge()),
 }
 
-// ── CAM-2: Location + seasonal context ────────────────────────────────────
 export const location = {
-  get:     () => window.electronAPI.getLocation(),
-  detect:  () => window.electronAPI.detectLocation(),
-  seasonal:() => window.electronAPI.getSeasonal(),
+  get:      () => ipc(a => a.getLocation(), null),
+  detect:   () => ipc(a => a.detectLocation(), null),
+  seasonal: () => ipc(a => a.getSeasonal(), null),
 }
 
-// ── BIE-1: Sequential pattern recognition ─────────────────────────────────
 export const sequences = {
-  get: () => window.electronAPI.getSequences(),
+  get: () => ipc(a => a.getSequences(), []),
 }
 
-// ── SGL-1: Guardrail enforcement ───────────────────────────────────────────
 export const guardrails = {
-  check: (predictionId) => window.electronAPI.checkGuardrail(predictionId),
+  check: (predictionId) => ipc(a => a.checkGuardrail(predictionId), { approved: true }),
 }
 
-// ── PAS-2: Form pre-filling ────────────────────────────────────────────────
 export const formFill = {
-  fill:           (context)  => window.electronAPI.fillForm(context),
-  fillDirect:     (formData) => window.electronAPI.fillFormDirect(formData),
-  fillSandboxed:  (formData) => window.electronAPI.fillFormSandboxed(formData),
+  fill:          (context)  => ipc(a => a.fillForm(context)),
+  fillDirect:    (formData) => ipc(a => a.fillFormDirect(formData)),
+  fillSandboxed: (formData) => ipc(a => a.fillFormSandboxed(formData)),
 }
 
-// ── CAM-3: Social context ─────────────────────────────────────────────────
 export const social = {
-  getContext:    () => window.electronAPI.getSocialContext(),
-  getTopContacts:() => window.electronAPI.getTopContacts(),
+  getContext:     () => ipc(a => a.getSocialContext(), {}),
+  getTopContacts: () => ipc(a => a.getTopContacts(), []),
 }
 
-// ── MMI-2: Voice logging ──────────────────────────────────────────────────
 export const voice = {
-  log: (data) => window.electronAPI.logVoice(data),
+  log: (d) => ipc(a => a.logVoice(d)),
 }
 
-// ── MMI-3: Overlay alternatives ────────────────────────────────────────────
 export const alternatives = {
-  get: (predictionId) => window.electronAPI.getAlternatives(predictionId),
+  get: (predictionId) => ipc(a => a.getAlternatives(predictionId), []),
 }
 
-// ── Ghost overlay ──────────────────────────────────────────────────────────
 export const overlay = {
-  show:    (prediction) => window.electronAPI.showOverlay(prediction),
-  dismiss: ()           => window.electronAPI.dismissOverlay(),
+  show:    (prediction) => ipc(a => a.showOverlay(prediction)),
+  dismiss: ()           => ipc(a => a.dismissOverlay()),
 }
 
-// ── Real-time event listeners ──────────────────────────────────────────────
+// In browser: no-op (no IPC events). In Electron: normal IPC.
 export const realtime = {
-  on:  (channel, cb) => window.electronAPI.on(channel, cb),
-  off: (channel)     => window.electronAPI.off(channel),
+  on:  (channel, cb) => { if (api) api.on(channel, cb) },
+  off: (channel)     => { if (api) api.off(channel) },
 }
 
-// ── BIE-1: User Behavior Graph ─────────────────────────────────────────────
 export const ubg = {
-  stats:        ()             => window.electronAPI.getUbgStats(),
-  patterns:     ()             => window.electronAPI.getUbgPatterns(),
-  predict:      (signal)       => window.electronAPI.ubgPredict(signal),
-  recordAction: (pred, outcome)=> window.electronAPI.ubgRecordAction(pred, outcome),
+  stats:        ()              => ipc(a => a.getUbgStats(), {}),
+  patterns:     ()              => ipc(a => a.getUbgPatterns(), []),
+  predict:      (signal)        => ipc(a => a.ubgPredict(signal), null),
+  recordAction: (pred, outcome) => ipc(a => a.ubgRecordAction(pred, outcome)),
 }
 
-// ── BIE-3: Preference Vector Engine ───────────────────────────────────────
 export const prefVectors = {
-  summary:  ()             => window.electronAPI.getPrefSummary(),
-  score:    (pred)         => window.electronAPI.getPrefScore(pred),
-  record:   (pred, outcome)=> window.electronAPI.recordPrefExtended(pred, outcome),
+  summary:  ()              => ipc(a => a.getPrefSummary(), {}),
+  score:    (pred)          => ipc(a => a.getPrefScore(pred), 0),
+  record:   (pred, outcome) => ipc(a => a.recordPrefExtended(pred, outcome)),
 }
 
-// ── PERF: Full performance report ─────────────────────────────────────────
 export const perfFull = {
-  report:       ()       => window.electronAPI.getFullPerfReport(),
-  pollInterval: (baseMs) => window.electronAPI.getPollInterval(baseMs),
+  report:       ()       => ipc(a => a.getFullPerfReport(), {}),
+  pollInterval: (baseMs) => ipc(a => a.getPollInterval(baseMs), baseMs),
 }
 
-// ── COMP: GDPR/CCPA Compliance ─────────────────────────────────────────────
 export const compliance = {
-  exportData:      () => window.electronAPI.exportUserData(),
-  erasureRequest:  () => window.electronAPI.erasureRequest(),
+  exportData:     () => ipc(a => a.exportUserData(), null),
+  erasureRequest: () => ipc(a => a.erasureRequest()),
 }
 
-// ── CAM-4: Signal sync ─────────────────────────────────────────────────────
 export const signalSync = {
-  push: (signal) => window.electronAPI.syncSignal(signal),
+  push: (signal) => ipc(a => a.syncSignal(signal)),
 }
